@@ -28,6 +28,9 @@ yarn-error.log*
 # local env files
 .env*.local
 
+# local session log (payment records)
+/.data/
+
 # vercel
 .vercel
 
