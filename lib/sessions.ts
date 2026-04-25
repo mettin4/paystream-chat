@@ -18,9 +18,21 @@ export type PaymentRecord = {
   network: string;
 };
 
+// On-chain checkpoint settlement (real 0x… tx hash from Arc), distinct from
+// the per-word Gateway authorizations stored in `payments`. These are produced
+// by lib/circle.ts → settleOnchain via W3S createTransaction.
+export type OnchainSettlement = {
+  timestamp: number;
+  wordCount: number;
+  amountUsdc: number;
+  txHash: string;
+  network: string;
+};
+
 export type Session = {
   createdAt: number;
   payments: PaymentRecord[];
+  onchainSettlements?: OnchainSettlement[];
 };
 
 type SessionsData = {
@@ -85,4 +97,31 @@ export async function listPayments(
 ): Promise<PaymentRecord[]> {
   const session = await getSession(sessionId);
   return session?.payments ?? [];
+}
+
+export function recordSettlement(
+  sessionId: string,
+  settlement: OnchainSettlement
+): Promise<void> {
+  return withWriteLock(async () => {
+    const data = await load();
+    if (!data.sessions[sessionId]) {
+      data.sessions[sessionId] = {
+        createdAt: Date.now(),
+        payments: [],
+        onchainSettlements: [],
+      };
+    }
+    const s = data.sessions[sessionId];
+    if (!s.onchainSettlements) s.onchainSettlements = [];
+    s.onchainSettlements.push(settlement);
+    await persist(data);
+  });
+}
+
+export async function listSettlements(
+  sessionId: string
+): Promise<OnchainSettlement[]> {
+  const session = await getSession(sessionId);
+  return session?.onchainSettlements ?? [];
 }

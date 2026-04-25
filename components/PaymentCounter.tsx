@@ -6,6 +6,7 @@ type Props = {
   wordCount: number;
   totalPaid: number;
   txCount: number;
+  settlementCount: number;
   sessionStart: number;
   promptCount: number;
   isStreaming: boolean;
@@ -15,6 +16,7 @@ export default function PaymentCounter({
   wordCount,
   totalPaid,
   txCount,
+  settlementCount,
   sessionStart,
   promptCount,
   isStreaming,
@@ -51,7 +53,8 @@ export default function PaymentCounter({
       <div className="flex flex-col divide-y divide-stroke-subtle">
         <StatRow label="Words" value={wordCount.toString()} />
         <StatRow label="Paid USDC" value={`$${totalPaid.toFixed(4)}`} />
-        <StatRow label="Transactions" value={txCount.toString()} />
+        <StatRow label="Authorizations" value={txCount.toString()} />
+        <StatRow label="Onchain Settlements" value={settlementCount.toString()} />
       </div>
 
       <div className="mt-4 border-t border-stroke-strong pt-3 font-mono text-[11px] text-ink-tertiary">

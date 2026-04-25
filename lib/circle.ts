@@ -15,7 +15,7 @@ import { BatchFacilitatorClient } from "@circle-fin/x402-batching/server";
 import type { Address } from "viem";
 
 import { makeW3sBatchEvmSigner } from "./circle-signer";
-import { recordPayment } from "./sessions";
+import { recordPayment, recordSettlement } from "./sessions";
 
 // ─────────────────────────────────────────────────────────────────────────
 // Public types
@@ -35,6 +35,22 @@ export type PaymentResult = {
   amountUsdc: number;
   wordCount: number;
   network: string;
+};
+
+// A real on-chain checkpoint settlement: 0x… tx hash from Arc, distinct from
+// the per-word Gateway authorization UUIDs in PaymentResult.txHash.
+export type SettlementResult = {
+  txHash: `0x${string}`;
+  amountUsdc: number;
+  wordCount: number;
+  network: string;
+};
+
+export type OnchainTx = {
+  id: string;
+  hash: string;
+  amount: number;
+  timestamp: number;
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -386,4 +402,186 @@ export async function payForPrompt(
 function atomicUsdc(decimal: number): string {
   const atomic = Math.round(decimal * 10 ** USDC_DECIMALS);
   return atomic.toString();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// On-chain checkpoint settlements (parallel to the Gateway authorization
+// flow above). Every N words emitted, the chat route fires one of these to
+// produce a real, immediately-visible USDC transfer on Arc Testnet, so the
+// operator wallet's explorer page shows on-chain activity per chat — not
+// just the eventual batched Gateway settlements (which can land 10+ minutes
+// later under a different originator address).
+//
+// Mechanism: W3S `createTransaction` (USDC native transfer from operator →
+// recipient), then poll `getTransaction` until state ∈ {CONFIRMED, COMPLETE}
+// and read back the real txHash.
+//
+// Concurrency: a single EOA has one nonce. W3S serializes per-wallet
+// internally (Initiated → Queued → Sent), so > 1 in-flight buys nothing and
+// just adds 429 risk. Cap at 1.
+// ─────────────────────────────────────────────────────────────────────────
+
+const ONCHAIN_BLOCKCHAIN = "ARC-TESTNET" as const;
+const ARC_TESTNET_USDC = "0x3600000000000000000000000000000000000000";
+const ONCHAIN_POLL_MS = 2000;
+const ONCHAIN_TIMEOUT_MS = 90_000;
+
+let onchainInflight = 0;
+const onchainWaiters: Array<() => void> = [];
+
+async function withOnchainSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (onchainInflight >= 1) {
+    await new Promise<void>((resolve) => onchainWaiters.push(resolve));
+  }
+  onchainInflight++;
+  try {
+    return await fn();
+  } finally {
+    onchainInflight--;
+    const next = onchainWaiters.shift();
+    if (next) next();
+  }
+}
+
+/**
+ * Throttled wrapper. Identical retry policy to payForPromptThrottled but on
+ * its own concurrency budget so it can't compete with the Gateway flow.
+ */
+export async function settleOnchainThrottled(
+  sessionId: string,
+  amountUsdc: number,
+  wordCount: number
+): Promise<SettlementResult> {
+  return withOnchainSlot(async () => {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        return await settleOnchain(sessionId, amountUsdc, wordCount);
+      } catch (err) {
+        lastErr = err;
+        if (!isRetriableError(err) || attempt === MAX_RETRIES) throw err;
+        const delay =
+          BASE_RETRY_DELAY_MS * 2 ** attempt + Math.random() * 500;
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+    throw lastErr;
+  });
+}
+
+/**
+ * Submit a real USDC transfer on Arc via W3S, then poll until the on-chain
+ * tx hash is available. Throws if the transaction fails, is denied, or the
+ * timeout elapses before W3S reports a hash.
+ *
+ * `wordCount` is metadata only — it labels the settlement as covering the
+ * last N words emitted by the model. The amount is what actually moves.
+ */
+export async function settleOnchain(
+  sessionId: string,
+  amountUsdc: number,
+  wordCount: number
+): Promise<SettlementResult> {
+  if (amountUsdc <= 0) {
+    throw new Error(`amountUsdc must be > 0, got ${amountUsdc}`);
+  }
+
+  const op = getOperatorConfig();
+  const recipient = getRecipientAddress();
+  const w3s = getW3s();
+
+  // W3S createTransaction accepts two input variants. The `walletId` variant
+  // forbids an outer `blockchain` field at the type level (even though the
+  // runtime API tolerates `walletId + tokenAddress + blockchain`), so we use
+  // the `walletAddress + blockchain + tokenAddress` variant — same wallet,
+  // identified by EOA address rather than UUID. Both resolve to the same
+  // developer-controlled wallet on Circle's side.
+  const created = await w3s.createTransaction({
+    walletAddress: op.address,
+    blockchain: ONCHAIN_BLOCKCHAIN,
+    tokenAddress: ARC_TESTNET_USDC,
+    amount: [amountUsdc.toString()],
+    destinationAddress: recipient,
+    fee: { type: "level", config: { feeLevel: "MEDIUM" } },
+    // Per-call random key so a transient failure mid-create doesn't double-
+    // submit on retry. (Retries inside settleOnchainThrottled re-call this
+    // function, getting a fresh key — that's intentional: the prior attempt
+    // either created the tx or it didn't, but if we got an error back we
+    // can't tell, so a fresh key is the safe default.)
+    idempotencyKey: cryptoRandomUuid(),
+  });
+
+  const txId = created.data?.id;
+  if (!txId) {
+    throw new Error(
+      `W3S createTransaction returned no id. Response: ${JSON.stringify(created)}`
+    );
+  }
+
+  const start = Date.now();
+  let hash: string | undefined;
+  let lastState: string | undefined;
+  while (Date.now() - start < ONCHAIN_TIMEOUT_MS) {
+    await new Promise((r) => setTimeout(r, ONCHAIN_POLL_MS));
+    const got = await w3s.getTransaction({ id: txId });
+    const tx = got.data?.transaction;
+    if (!tx) continue;
+    lastState = tx.state;
+    if (tx.state === "FAILED" || tx.state === "DENIED" || tx.state === "CANCELLED") {
+      throw new Error(
+        `W3S transaction ${txId} terminal state=${tx.state} (txHash=${tx.txHash ?? "none"})`
+      );
+    }
+    if (tx.txHash && (tx.state === "CONFIRMED" || tx.state === "COMPLETE" || tx.state === "SENT")) {
+      // SENT means broadcast — the txHash is real and the tx is in the
+      // mempool. CONFIRMED/COMPLETE mean it's mined. Any of these are good
+      // enough to surface in the UI; the hash will resolve on the explorer
+      // either immediately or within a block.
+      hash = tx.txHash;
+      break;
+    }
+  }
+
+  if (!hash) {
+    throw new Error(
+      `W3S transaction ${txId} timed out after ${ONCHAIN_TIMEOUT_MS}ms (last state=${lastState ?? "unknown"})`
+    );
+  }
+
+  if (!hash.startsWith("0x")) {
+    throw new Error(`W3S returned non-hex txHash: ${hash}`);
+  }
+
+  const result: SettlementResult = {
+    txHash: hash as `0x${string}`,
+    amountUsdc,
+    wordCount,
+    network: `eip155:${CHAIN_CONFIGS[CHAIN_NAME].chain.id}`,
+  };
+
+  await recordSettlement(sessionId, {
+    timestamp: Date.now(),
+    wordCount,
+    amountUsdc,
+    txHash: result.txHash,
+    network: result.network,
+  });
+
+  return result;
+}
+
+function cryptoRandomUuid(): string {
+  // Node 19+ exposes globalThis.crypto.randomUUID. Falls back to a manual
+  // generator only if (somehow) unavailable.
+  const g = globalThis as { crypto?: { randomUUID?: () => string } };
+  if (g.crypto?.randomUUID) return g.crypto.randomUUID();
+  // RFC 4122 v4 fallback
+  const b = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) b[i] = Math.floor(Math.random() * 256);
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = (n: number) => n.toString(16).padStart(2, "0");
+  const seg = (start: number, end: number) =>
+    Array.from(b.slice(start, end)).map(h).join("");
+  return `${seg(0, 4)}-${seg(4, 6)}-${seg(6, 8)}-${seg(8, 10)}-${seg(10, 16)}`;
 }

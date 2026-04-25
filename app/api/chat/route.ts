@@ -1,7 +1,7 @@
 import { cookies } from "next/headers";
 
 import { streamChat, type ChatMessage } from "@/lib/anthropic";
-import { payForPromptThrottled } from "@/lib/circle";
+import { payForPromptThrottled, settleOnchainThrottled } from "@/lib/circle";
 import {
   SESSION_COOKIE_NAME,
   verifySessionCookie,
@@ -10,12 +10,27 @@ import {
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// Payment model: one on-chain nanopayment per word emitted by the model. Each
-// word triggers a fire-and-forget payForPrompt(sessionId, 1). These run in
-// parallel against Circle Gateway — the stream doesn't wait for them. They
-// land in sessions.json as they complete, and the client polls
-// /api/transactions to watch the feed fill in real time. A 100-word reply
-// produces ~100 on-chain settlements.
+// Payment model has two parallel tracks:
+//
+//   (1) Per-word Gateway authorization. Every word fires a fire-and-forget
+//       payForPromptThrottled(sessionId, 1). These sign an EIP-3009
+//       authorization via Circle Gateway and queue for batched async
+//       settlement (Circle's batcher lands them on chain minutes-to-hours
+//       later, originated by a Circle-controlled EOA — not by our operator).
+//
+//   (2) Periodic on-chain checkpoint. Every CHECKPOINT_EVERY_N_WORDS words,
+//       a fire-and-forget settleOnchainThrottled fires a real W3S
+//       createTransaction (USDC transfer from operator → recipient on Arc
+//       Testnet) for CHECKPOINT_AMOUNT_USDC. These produce immediately-
+//       visible 0x… tx hashes from our operator wallet on testnet.arcscan.app
+//       — distinct from the Gateway flow, on its own concurrency budget.
+//
+// Both tracks land independently in sessions.json. The client polls
+// /api/transactions and renders authorizations + settlements in separate UI
+// surfaces.
+
+const CHECKPOINT_EVERY_N_WORDS = 10;
+const CHECKPOINT_AMOUNT_USDC = 0.001;
 
 type ChatRequest = {
   messages?: ChatMessage[];
@@ -48,6 +63,11 @@ export async function POST(req: Request) {
       // run; everything up to that whitespace is a complete word and gets
       // charged. The trailing partial word stays in the buffer.
       let buffer = "";
+      // Cumulative word count for this stream — used to fire a checkpoint
+      // settlement every CHECKPOINT_EVERY_N_WORDS. Tracked locally because
+      // the client's word event counter resets per stream.
+      let totalWords = 0;
+      let nextCheckpointAt = CHECKPOINT_EVERY_N_WORDS;
 
       function chargeWords(n: number) {
         for (let i = 0; i < n; i++) {
@@ -61,6 +81,22 @@ export async function POST(req: Request) {
             // Gateway balance, etc.).
             console.error("[api/chat] word payment failed:", err);
           });
+        }
+        totalWords += n;
+        while (totalWords >= nextCheckpointAt) {
+          // Fire-and-forget. The throttled variant has its own concurrency
+          // budget (cap 1) so checkpoints can't compete with the Gateway
+          // flow. Each settlement is a real on-chain USDC transfer from
+          // operator → recipient and lands in onchainSettlements with a
+          // real 0x… hash.
+          settleOnchainThrottled(
+            sessionId!,
+            CHECKPOINT_AMOUNT_USDC,
+            CHECKPOINT_EVERY_N_WORDS
+          ).catch((err) => {
+            console.error("[api/chat] checkpoint settlement failed:", err);
+          });
+          nextCheckpointAt += CHECKPOINT_EVERY_N_WORDS;
         }
       }
 

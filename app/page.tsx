@@ -3,25 +3,27 @@
 import { useEffect, useState } from "react";
 import ChatInterface from "@/components/ChatInterface";
 import PaymentCounter from "@/components/PaymentCounter";
+import RecentSettlements from "@/components/RecentSettlements";
 import TransactionFeed from "@/components/TransactionFeed";
-import type { Transaction } from "@/lib/circle";
+import type { OnchainTx, Transaction } from "@/lib/circle";
 
 const PRICE_PER_WORD = 0.0001;
 
 // Polling cadence for the transaction feed. While the stream is live we
 // poll aggressively so the feed fills in near-real-time as per-word
-// payments settle. After the stream ends we keep polling at a slower rate
-// for a short tail window to catch settlements that complete *after* the
-// stream closes (payForPrompt runs fire-and-forget, so the last few words
-// can land seconds later).
+// authorizations settle. After the stream ends we keep polling at a slower
+// rate for a longer tail window — on-chain checkpoint settlements via W3S
+// serialize per operator wallet (one EOA nonce) and take 5-15s each, so
+// the last few of a long reply may land 60-120s after the stream closes.
 const POLL_MS_STREAMING = 1200;
-const POLL_MS_TAIL = 2000;
-const TAIL_WINDOW_MS = 8000;
+const POLL_MS_TAIL = 3000;
+const TAIL_WINDOW_MS = 120_000;
 
 export default function Home() {
   const [wordCount, setWordCount] = useState(0);
   const [promptCount, setPromptCount] = useState(0);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [settlements, setSettlements] = useState<OnchainTx[]>([]);
   const [operatorAddress, setOperatorAddress] = useState<string | null>(null);
   const [sessionStart] = useState(() => Date.now());
   const [isStreaming, setIsStreaming] = useState(false);
@@ -30,12 +32,15 @@ export default function Home() {
 
   // Payments persisted in sessions.json survive page reloads, but the
   // in-memory counters (words / prompts / elapsed) reset with each load.
-  // Show only payments from the current page-load session so the feed
-  // doesn't read "236 txs for $0.00" on fresh reload. Older payments
+  // Show only items from the current page-load session so the feed
+  // doesn't read "236 txs for $0.00" on fresh reload. Older items
   // remain in storage for debugging / audit — they're just not surfaced
-  // in this view.
+  // in this view. Same filter applies to on-chain settlements.
   const currentSessionTxs = transactions.filter(
     (tx) => tx.timestamp >= sessionStart
+  );
+  const currentSessionSettlements = settlements.filter(
+    (s) => s.timestamp >= sessionStart
   );
 
   useEffect(() => {
@@ -47,10 +52,12 @@ export default function Home() {
         if (!res.ok) return;
         const data = (await res.json()) as {
           transactions?: Transaction[];
+          settlements?: OnchainTx[];
           operatorAddress?: string | null;
         };
         if (cancelled) return;
         setTransactions(data.transactions ?? []);
+        setSettlements(data.settlements ?? []);
         if (data.operatorAddress) setOperatorAddress(data.operatorAddress);
       } catch {
         // Non-fatal — next tick will retry.
@@ -98,13 +105,18 @@ export default function Home() {
       </section>
 
       <section className="grid grid-cols-1 items-start gap-6 pb-12 lg:grid-cols-[3fr_2fr]">
-        <div className="fade-up [animation-delay:50ms]">
-          <ChatInterface
-            onWordEvent={handleWordEvent}
-            onPromptSent={handlePromptSent}
-            onStreamingChange={setIsStreaming}
-            pricePerWord={PRICE_PER_WORD}
-          />
+        <div className="flex flex-col gap-6">
+          <div className="fade-up [animation-delay:50ms]">
+            <ChatInterface
+              onWordEvent={handleWordEvent}
+              onPromptSent={handlePromptSent}
+              onStreamingChange={setIsStreaming}
+              pricePerWord={PRICE_PER_WORD}
+            />
+          </div>
+          <div className="fade-up [animation-delay:200ms]">
+            <RecentSettlements settlements={currentSessionSettlements} />
+          </div>
         </div>
         <aside className="flex flex-col gap-6">
           <div className="fade-up [animation-delay:100ms]">
@@ -112,6 +124,7 @@ export default function Home() {
               wordCount={wordCount}
               totalPaid={totalPaid}
               txCount={currentSessionTxs.length}
+              settlementCount={currentSessionSettlements.length}
               sessionStart={sessionStart}
               promptCount={promptCount}
               isStreaming={isStreaming}

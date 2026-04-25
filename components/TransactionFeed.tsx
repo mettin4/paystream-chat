@@ -61,7 +61,7 @@ function TransactionRow({
   operatorAddress: string | null;
 }) {
   const confirmed = tx.status !== "pending";
-  const label = tx.word ?? `tx ${tx.id.slice(0, 6)}`;
+  const label = tx.word ?? `auth ${tx.id.slice(0, 6)}`;
   // The tx.hash is Circle's internal settlement UUID — doesn't resolve on
   // Arc Explorer. Link each row to the operator address instead; that page
   // shows the operator's real on-chain activity (deposit/approve txs, and
